@@ -1,168 +1,299 @@
-/*
-   Version adapted by Patrick Hixenbaugh to use the RTC's own Temperature Sensor
-   patrick.hixenbaugh@gmail.com
-   
-   For the Riffle Datalogger
-   Sketch logs the Temperature from the RTC at an interval.
-   It uses the RTC as a scheduler by using an Alarm and Interrupt
-   pin to wake up the ATmega at an interval.
-   It logs to the SD card and outputs time and values in the Serial
-   Monitor
-   
-   This sketch has some code referencing a humidity sensor which has been
-   commented out.
-
-   This Sketch uses the SdFat.h library instead of the SD.h library that is
-   is included in the IDE due to a bug which doesn't allow the SD card to sleep.
-
-   Also, disabling the Serial writes will save some power. Once everything is
-   tested and working set the debug variable to 0 to disable Serial.
-
-   Kina Smith
-   kina.smith@gmail.com
-*/
-
-
+#include "LowPower.h"         //https://github.com/rocketscream/Low-Power
 #include <Wire.h>
 #include <SPI.h>
-// #include <SHT2x.h>    //  https://github.com/misenso/SHT2x-Arduino-Library
-#include <SdFat.h>    //  https://github.com/greiman/SdFat
-#include <EnableInterrupt.h>  //  https://github.com/GreyGnome/EnableInterrupt
-#include <DS3231.h>   //  https://github.com/kinasmith/DS3231
-#include <LowPower.h>   //  https://github.com/rocketscream/Low-Power
+#include <DS3232RTC.h>        //http://github.com/JChristensen/DS3232RTC
+#include<stdlib.h>
+#include <SD.h>
+#include <Time.h>  //https://github.com/PaulStoffregen/Time
 
-#define debug 0
+//sleeping stuff
+#define sleep_intervals 1
 
-DS3231 rtc; //initialize the Real Time Clock
-
-SdFat sd; //SD card
-SdFile myFile; //File to save to
-
+#define sleepytime 1000 // millis
+//RTC stuff
+//RTC_DS3231 RTC;
 
 
-const int led = 9; //led pin
-const int bat_v_pin = A3; //battery voltage pin (1/2 of actual voltage)
-const int bat_v_enable = 4; //enable pin for bat. voltage read
-const int sd_pwr_enable = 6; //enable pin for SD power
-const int chipSelect = 7; //chipSelect for SD card
-const int RTC_INT = 5; //RTC interrupt pin
-const int pinout_pwr_enable = 8; //enable pin for header power
+//led
+#define led 9
 
-int interval_sec = 30; //Logging interval in seconds
+//voltage stuff
+#define voltageAnalogMeasurePin A3
+#define voltageReadCircuitSwitch 4
 
-//sensor values
-float bat_v;
-float temp;
-//float humidity; //removed since RTC doesn't have this
+const byte interruptPin = 3; // the pin that we're measuring freq from -- can only be digital pin 2 or 3 on the arduino uno 
 
-void pin5_interrupt() {
-  disableInterrupt(RTC_INT); //first it Disables the interrupt so it doesn't get retriggered
-}
 
-//Puts the MCU into power saving sleep mode and sets the wake time
-void enterSleep(DateTime& dt) { //argument is Wake Time as a DateTime object
-  rtc.clearAlarm(); //resets the alarm interrupt status on the RTC
-  enableInterrupt(RTC_INT, pin5_interrupt, FALLING); //enables the interrupt on Pin5
-  rtc.enableAlarm(dt); //Sets the alarm on the RTC to the specified time (using the DateTime Object passed in)
-  delay(100); //wait for a moment for everything to complete
-  LowPower.powerDown(SLEEP_FOREVER, ADC_OFF, BOD_OFF); //power down everything until the alarm fires
-}
+// debugging -- only do Serial output if debugging
+#define debug 1 // 0: don't print anything out; 1: print out debugging statements
 
-float getBat_v(int read, int en) {
-  float v;
-  digitalWrite(en, LOW); //write mosfet low to enable read
-  delay(10); //wait for it to settle
-  v = analogRead(read); //read voltage
-  delay(10); //wait some more...for some reason
-  digitalWrite(en, HIGH); //disable read circuit
-  v = (v * (3.3 / 1024.0)) * 2.0; //calculate actual voltage
-  return v;
-}
+#define sensorBoard 8 // the pin that powers the 555 subcircuit
 
-// Changed to reflect new order of data
-void writeDataToCard(long utc, float t, float v) { //changed order, removed humidity. original: void writeDataToCard(float t, float h, float v, long utc) {
-  //open and write files to SD card
-  if (!myFile.open("data.csv", O_RDWR | O_CREAT | O_AT_END))  //open file
-    while (1) Blink(led, 200); //if fails to open, blink forever
-  myFile.print(utc);
-  myFile.print(",");
-//  myFile.print(h);
-//  myFile.print(",");
-  myFile.print(t);
-  myFile.print(",");
-  myFile.print(v);
-  myFile.println();
-  myFile.close();
-}
+#define chipSelect 7
+#define SDpower 6
 
-void Blink(byte PIN, int DELAY_MS) {
-  //Blink an LED
-  pinMode(PIN, OUTPUT);
-  digitalWrite(PIN, HIGH);
-  delay(DELAY_MS);
-  digitalWrite(PIN, LOW);
-  delay(DELAY_MS);
-}
+#define analog_pin A0
+
+long pulseCount = 0;  //a pulse counter variable
+
+unsigned long pulseTime,lastTime, duration, totalDuration;
+
+int samplingPeriod=4; // the number of seconds to measure 555 oscillations
+
+
+double freq; // 
 
 void setup() {
-  Wire.begin();
-  if (debug == 1) {
-    Serial.begin(9600); //changed debug to debug == 1 to try and get serial working
-    Serial.println("Serial Begin");
-  }
-  pinMode(bat_v_enable, OUTPUT);
-  pinMode(sd_pwr_enable, OUTPUT);
-  pinMode(RTC_INT, INPUT_PULLUP); //RTC interrupt line requires a pullup
-  pinMode(pinout_pwr_enable, OUTPUT);
-  digitalWrite(pinout_pwr_enable, HIGH);
-  rtc.begin(); //start RTC
-  if (debug) rtc.adjust(DateTime((__DATE__), (__TIME__))); //sets the RTC to the computer time. //can this cause problems; is it needed?
 
-  digitalWrite(sd_pwr_enable, LOW); //Enable power for SD card
-  delay(1); //wait for pin to settle
-  if (!sd.begin(chipSelect)) {
-    if (debug) Serial.println("Card failed, or not present");
-    while (1) {
-      Blink(led, 200); // fast blink indicates SD card problem
+if(debug) Serial.begin(9600);
+
+// indicate successful startup
+
+for (int i=0;i<3;i++) {
+  digitalWrite(led, HIGH);   
+  delay(1000);
+  digitalWrite(led, LOW);
+  delay(1000);
+}
+
+  // RTC setup
+
+ setSyncProvider(RTC.get);
+    //Serial << F("RTC Sync");
+    //if (timeStatus() != timeSet) Serial << F(" FAIL!");
+    //Serial << endl;
+
+    
+  
+
+  /// SD setup
+  
+  
+  pinMode(SDpower,OUTPUT);
+    digitalWrite(SDpower,LOW);
+
+    delay(1000);
+    
+     if (!SD.begin(chipSelect)) {
+  if (debug) Serial.println("Card failed, or not present");
+
+   // indicate SD problem with fast blink
+    while(1) {
+      digitalWrite(led,HIGH);
+      delay(200);
+      digitalWrite(led,LOW);
+       delay(200);
     }
   }
-  if (debug) Serial.println("SD Card Initialized");
+
+  
+  
+  if (debug) Serial.begin(9600);
+  
+  // begin I2C protocol (necessary for RTC, and any other I2C on board
+  Wire.begin();
+
+
+
+  
+  // RTC -------------------------
+  //initialize_RTC(); // NOTE: need to initialize I2C first -- but also for any other I2C library
+  
+  // set mode for voltage circuit control pin, and turn the circuit off
+  pinMode(voltageReadCircuitSwitch,OUTPUT);
+  pinMode(sensorBoard,OUTPUT);  
+  pinMode(led, OUTPUT);     
+  
+  //digitalWrite(sensorBoard,LOW); //turns on the 555 timer and thermistor subcircuit
+  uint8_t i;
+  
+  //measure the input voltage 
+  digitalWrite(voltageReadCircuitSwitch, HIGH); //turn on voltage measurement circuit
+  digitalWrite(sensorBoard,HIGH);
+  
+  // wait a moment to let things settle
+  
 }
 
-void loop() {
-  DateTime now = rtc.now(); //get the current time
-  DateTime nextAlarm = DateTime(now.unixtime() + interval_sec);
-  if (debug) {
-    Serial.print("The Current Time is: ");
-    Serial.print(now.unixtime());
-    Serial.println();
+void loop () {
+
+static time_t tLast;
+    time_t t;
+    tmElements_t tm;
+
+t = now();
+  // RTC test
+
+    
+  
+
+  
+  // Onboard temp from the RTC
+ float rtcTemp = RTC.temperature() / 4.;
+
+
+  digitalWrite(sensorBoard,LOW);
+  
+  // measure an analog battery
+  int analog_value = analogRead(analog_pin);
+
+
+  // depth sensor
+
+  delay(2000); // give time for 555 to recover
+
+
+  pulseCount=0; //reset the pulse counter
+  totalDuration=0;  //reset the totalDuration of all pulses measured
+  
+  attachInterrupt(digitalPinToInterrupt(interruptPin),onPulse,RISING); //attach an interrupt counter to interrupt pin 0 (digital pin #2) -- the only other possible pin on the 328p is interrupt pin #1 (digital pin #3)
+  
+  pulseTime=micros(); // start the stopwatch
+  
+  delay(samplingPeriod*1000); //give ourselves samplingPeriod seconds to make this measurement, during which the "onPulse" function will count up all the pulses, and sum the total time they took as 'totalDuration' 
+ 
+  detachInterrupt(digitalPinToInterrupt(interruptPin)); //we've finished sampling, so detach the interrupt function -- don't count any more pulses
+  
+  
+  if (pulseCount>0) { //use this logic in case something went wrong
+  
+  double durationS=totalDuration/double(pulseCount)/1000000.; //the total duration, in seconds, per pulse (note that totalDuration was in microseconds)
+  
+  // print out stats
+  /*
+  Serial.print("sampling period=");
+  Serial.print(samplingPeriod);
+    Serial.print(" sec; #pulses=");
+  Serial.print(pulseCount);
+  Serial.print("; duration per pulse (sec)=");
+  Serial.println(durationS,8);
+*/
+
+  freq=1./durationS;
+  
+
   }
-  //take readings
-  bat_v = getBat_v(bat_v_pin, bat_v_enable); //takes 20ms
-  temp = rtc.getTemperature(); //changed to RTC's reading
-  //  temp = 0;
-  //  humidity = SHT2x.GetHumidity();
-  //humidity = 0;
-  if (debug) {
-    Serial.print("Temp: ");
-    Serial.print(temp);
-    Serial.print(", ");
-    // Serial.print("Humidity: ");
-    // Serial.print(humidity);
-    // Serial.print(", ");
-    Serial.print("Batt V: ");
-    Serial.print(bat_v);
-    Serial.println();
+
+  digitalWrite(sensorBoard,HIGH);
+
+  
+  
+  // make a string for assembling the data to log:
+  String dataString = "";
+  
+  // dataString += String(unixNow);
+//  dataString += now.unixtime();
+  //dataString += ",";
+  dataString += year();
+  dataString += "-";
+  dataString += padInt(month(), 2);
+  dataString += "-";
+  dataString += padInt(day(), 2);
+  dataString += " ";
+  dataString += padInt(hour(), 2);
+  dataString += ":";
+  dataString += padInt(minute(), 2);
+  dataString += ":";
+  dataString += padInt(second(), 2);
+  dataString += ",";
+  char buffer[10];
+  dataString += dtostrf(rtcTemp, 5, 2, buffer);
+  dataString += ",";
+  dataString += dtostrf(freq, 5, 2, buffer);
+
+  
+  
+  
+  if(debug) Serial.println(dataString);
+  
+  // open the file. note that only one file can be open at a time,
+  // so you have to close this one before opening another.
+  File dataFile = SD.open("datalog.csv", FILE_WRITE);
+
+  // if the file is available, write to it:
+  if (dataFile) {
+    dataFile.println(dataString);
+    dataFile.close();
+    // print to the serial port too:
+   
+
+  //indicate successful write with short blink
+  digitalWrite(led, HIGH);   
+  delay(40);
+  digitalWrite(led, LOW);
+
   }
-  //write data
-  writeDataToCard(now.unixtime(),temp, bat_v);
-  Blink(led, 100); // single blink indicates data written
-  if (debug) {
-    Serial.print("Sleeping for ");
-    Serial.print(interval_sec);
-    Serial.print(" seconds.");
-    Serial.println();
+  // if the file isn't open, pop up an error:
+  else {
+    if (debug) Serial.println("error opening datalog.txt");
   }
-  enterSleep(nextAlarm); //enter Sleep until alarm fires
+  
+// sleep for a while
+if (debug==0) {
+sleep_for_8s_interval(sleep_intervals);
+
+}
+else {
+delay(sleepytime);
+  
+}
+    
+}
+  
+
+String padInt(int x, int pad) {
+  String strInt = String(x);
+  
+  String str = "";
+  
+  if (strInt.length() >= pad) {
+    return strInt;
+  }
+  
+  for (int i=0; i < (pad-strInt.length()); i++) {
+    str += "0";
+  }
+  
+  str += strInt;
+  
+  return str;
 }
 
+String int2string(int x) {
+  // formats an integer as a string assuming x is in 1/100ths
+  String str = String(x);
+  int strLen = str.length();
+  if (strLen <= 2) {
+    str = "0." + str;
+  } else if (strLen <= 3) {
+    str = str.substring(0, 1) + "." + str.substring(1);
+  } else if (strLen <= 4) {
+    str = str.substring(0, 2) + "." + str.substring(2);
+  } else {
+    str = "-9999";
+  }
+  
+  return str;
+}
+
+void sleep_for_8s_interval(int numIntervals) { // will power down for numIntervals * 8 seconds 
+
+for (int i=0;i<numIntervals;i++) {
+LowPower.powerDown(SLEEP_8S, ADC_OFF, BOD_OFF);
+}
+
+}
+
+
+
+void onPulse()
+{
+  pulseCount++;
+  //Serial.print("pulsecount=");
+  //Serial.println(pulseCount);
+  lastTime = pulseTime;
+  pulseTime = micros();
+  duration=pulseTime-lastTime;
+  totalDuration+=duration;
+  //Serial.println(totalDuration);
+}
